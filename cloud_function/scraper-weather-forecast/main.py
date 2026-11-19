@@ -32,6 +32,16 @@ MAX_LEAD = int(os.getenv("MAX_LEAD_HOURS", "24"))
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-student-scraper (UConn)")
 
 MASTER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
+# Final project: the NWS forecast at 6 more airports, for a population-weighted Connecticut temperature.
+# Saved to their own file (one row per station, scrape hour and forecast hour); the Bradley file above never changes.
+CT_MASTER_KEY = f"{ENERGY_PREFIX}/datasets/ct_weather_forecast_master.csv"
+EXTRA_POINTS = {"HFD": ("41.7367", "-72.6494"),     # Hartford-Brainard
+                "BDR": ("41.1635", "-73.1262"),     # Bridgeport (Sikorsky)
+                "HVN": ("41.2638", "-72.8868"),     # New Haven (Tweed)
+                "GON": ("41.3301", "-72.0451"),     # Groton-New London
+                "DXR": ("41.3715", "-73.4822"),     # Danbury
+                "HPN": ("41.0670", "-73.7076")}     # White Plains, NY (next to Fairfield County)
+CT_COLUMNS = ["temp_f", "dewpoint_f"]
 # (DWML tag, its "type" attribute) -> our column name; units: F, %, mph, degrees, inches
 FIELDS = {("temperature", "hourly"): "temp_f", ("temperature", "dew point"): "dewpoint_f",
           ("humidity", "relative"): "rel_humidity_pct", ("wind-speed", "sustained"): "wind_speed_mph",
@@ -42,8 +52,8 @@ FIELDS = {("temperature", "hourly"): "temp_f", ("temperature", "dew point"): "de
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
 
-def download_forecast() -> str:
-    url = f"https://forecast.weather.gov/MapClick.php?lat={LAT}&lon={LON}&FcstType=digitalDWML"
+def download_forecast(lat: str = LAT, lon: str = LON) -> str:
+    url = f"https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&FcstType=digitalDWML"
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
     r.raise_for_status()
     return r.text
@@ -97,8 +107,40 @@ def run_once(dry_run: bool = False) -> dict:
         master = keep
     master = master.sort_values(["scraped_hour_utc", "target_hour_utc"])
     bucket.blob(MASTER_KEY).upload_from_string(master.to_csv(index=False), content_type="text/csv")
-    return {"status": "ok", "issued_at_utc": issued.isoformat(), "rows_this_run": int(len(keep)),
-            "scrape_hours_in_master": int(master["scraped_hour_utc"].nunique()), "master_key": MASTER_KEY}
+    result = {"status": "ok", "issued_at_utc": issued.isoformat(), "rows_this_run": int(len(keep)),
+              "scrape_hours_in_master": int(master["scraped_hour_utc"].nunique()), "master_key": MASTER_KEY}
+    try:                         # the extra airports never cost you the Bradley forecast
+        result.update(scrape_extra_points(bucket, keep, scraped_hour))
+    except Exception as err:
+        result["ct_error"] = str(err)[:300]
+    return result
+
+
+def scrape_extra_points(bucket, bdl_rows, scraped_hour) -> dict:
+    """Final project: temperature and dew point from the NWS forecast at 6 more airports, plus Bradley's rows,
+    appended to ct_weather_forecast_master.csv. A station that fails is skipped; Bradley's file is already saved."""
+    frames = [bdl_rows[["scraped_hour_utc", "issued_at_utc", "target_hour_utc", "lead_hours"] + CT_COLUMNS].assign(station="BDL")]
+    failed = []
+    for station, (lat, lon) in EXTRA_POINTS.items():
+        try:
+            issued, table = parse_forecast(download_forecast(lat, lon))
+            rows = table[(table.index >= scraped_hour) & (table.index <= scraped_hour + pd.Timedelta(hours=MAX_LEAD))].copy()
+            rows["lead_hours"] = ((rows.index - scraped_hour) / pd.Timedelta(hours=1)).astype(int)
+            rows["scraped_hour_utc"] = scraped_hour
+            rows["issued_at_utc"] = issued
+            rows = rows.reset_index()
+            frames.append(rows[["scraped_hour_utc", "issued_at_utc", "target_hour_utc", "lead_hours"] + CT_COLUMNS].assign(station=station))
+        except Exception as err:
+            failed.append(station)
+            logging.warning("Extra point %s failed: %s", station, err)
+    new = pd.concat(frames, ignore_index=True)
+    blob = bucket.blob(CT_MASTER_KEY)
+    if blob.exists():
+        old = pd.read_csv(io.BytesIO(blob.download_as_bytes()), parse_dates=["scraped_hour_utc", "issued_at_utc", "target_hour_utc"])
+        new = pd.concat([old, new], ignore_index=True).drop_duplicates(["station", "scraped_hour_utc", "target_hour_utc"], keep="last")
+    new = new.sort_values(["scraped_hour_utc", "station", "target_hour_utc"])
+    blob.upload_from_string(new.to_csv(index=False), content_type="text/csv")
+    return {"ct_stations_ok": 1 + len(EXTRA_POINTS) - len(failed), "ct_stations_failed": failed, "ct_master_key": CT_MASTER_KEY}
 
 
 def scrape_weather_forecast_http(request):
