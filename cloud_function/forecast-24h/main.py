@@ -57,7 +57,8 @@ POOL_QUANTILES = [0.025, 0.075, 0.125, 0.175, 0.225, 0.275, 0.325, 0.375, 0.425,
                   0.775, 0.825, 0.875, 0.925, 0.975]
 WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
 LOAD_KEY = f"{ENERGY_PREFIX}/datasets/ct_load_5min_hourly_master.csv"
-# Final project (optional): NWS forecasts at 7 airports (scraper-weather-forecast), averaged with population weights
+# Final project (optional): NWS forecasts at 9 airports (scraper-weather-forecast). These 7 are averaged with population
+# weights into one Connecticut temperature; JFK and Boston are inputs of their own.
 CT_WEATHER_KEY = f"{ENERGY_PREFIX}/datasets/ct_weather_forecast_master.csv"
 STATION_WEIGHTS = {"BDL": 0.45, "HFD": 0.45, "BDR": 0.40, "DXR": 0.20, "HPN": 0.36, "HVN": 0.86, "GON": 0.27}
 LATEST_KEY = f"{ENERGY_PREFIX}/forecasts/latest.csv"
@@ -72,8 +73,12 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 WEATHER = ["temp_f", "dewpoint_f", "rel_humidity_pct", "wind_speed_mph", "cloud_cover_pct"]
 CALENDAR = ["hour", "day_of_week", "month", "is_weekend", "is_holiday"]
 FEATURES = CALENDAR + WEATHER + ["load_yesterday_mw"]
-# Final project (optional): 3 more inputs. A model uses them only if its model card's "features" list names them.
-EXTRA_FEATURES = ["ct_temp_f", "ct_dewpoint_f", "solar_proxy"]
+# Final project (optional): 5 more inputs. A model uses them only if its model card's "features" list names them.
+EXTRA_FEATURES = ["ct_temp_f", "ct_dewpoint_f", "solar_proxy", "jfk_temp_f", "bos_temp_f"]
+# Each extra weather input and the Bradley column that stands in when it's missing
+EXTRA_WEATHER = {"ct_temp_f": "temp_f", "ct_dewpoint_f": "dewpoint_f", "jfk_temp_f": "temp_f", "bos_temp_f": "temp_f"}
+# The temperature inputs that "nudge_temp_sd" (model card) shifts together, like a forecast that runs warm or cold
+TEMPERATURE_INPUTS = ["temp_f", "dewpoint_f", "ct_temp_f", "ct_dewpoint_f", "jfk_temp_f", "bos_temp_f"]
 
 
 def solar_proxy(hours_utc, cloud_cover_pct):
@@ -94,8 +99,8 @@ def make_features(hours_utc, weather, load, extra=False):
     """One row of model inputs per hour.
     hours_utc: the hours to describe (UTC).  weather: table indexed by UTC hour with the WEATHER columns.
     load: Connecticut load in MW, indexed by UTC hour (only hours that are already over).
-    extra=True also builds EXTRA_FEATURES: the Connecticut temperature and dew point (columns "ct_temp_f" and
-    "ct_dewpoint_f" in weather; Bradley's values where they're missing) and the solar proxy."""
+    extra=True also builds EXTRA_FEATURES: the Connecticut temperature and dew point and the JFK and Boston
+    temperatures (columns of the same name in weather; Bradley's values where they're missing) and the solar proxy."""
     hours_utc = pd.DatetimeIndex(hours_utc)
     local = hours_utc.tz_convert("America/New_York")           # people use electricity on local time
     out = pd.DataFrame(index=hours_utc)
@@ -116,7 +121,7 @@ def make_features(hours_utc, weather, load, extra=False):
     out["load_yesterday_mw"] = np.where(np.isnan(yesterday), hour_before, yesterday)
     if not extra:
         return out[FEATURES]
-    for column, bradley in [("ct_temp_f", "temp_f"), ("ct_dewpoint_f", "dewpoint_f")]:
+    for column, bradley in EXTRA_WEATHER.items():
         values = weather[column].reindex(hours_utc).values if column in weather.columns else np.full(len(out), np.nan)
         out[column] = np.where(np.isnan(np.asarray(values, dtype=float)), out[bradley].values, values)
     out["solar_proxy"] = solar_proxy(hours_utc, out["cloud_cover_pct"].values)
@@ -141,23 +146,26 @@ def latest_weather(forecasts: pd.DataFrame) -> pd.DataFrame:
 
 
 def ct_weather(bucket) -> pd.DataFrame:
-    """Final project: the population-weighted Connecticut temperature and dew point for every target hour, from the
-    NEWEST forecast of each airport. Weights are re-scaled over the airports that have a value, so one missing airport
-    just means six. Empty table if the file isn't there yet."""
+    """Final project: for every target hour, from the NEWEST forecast of each airport, the population-weighted
+    Connecticut temperature and dew point (weights re-scaled over the airports that have a value, so one missing
+    airport just means six) and the JFK and Boston temperatures. Empty table if the file isn't there yet."""
+    names = ["ct_temp_f", "ct_dewpoint_f", "jfk_temp_f", "bos_temp_f"]
     table = read_csv(bucket, CT_WEATHER_KEY)
     if table is None or len(table) == 0:
-        return pd.DataFrame(columns=["ct_temp_f", "ct_dewpoint_f"])
+        return pd.DataFrame(columns=names)
     table["scraped_hour_utc"] = pd.to_datetime(table["scraped_hour_utc"], utc=True)
     table["target_hour_utc"] = pd.to_datetime(table["target_hour_utc"], utc=True)
-    table = table[table["station"].isin(STATION_WEIGHTS)].sort_values("scraped_hour_utc")
-    newest = table.drop_duplicates(["station", "target_hour_utc"], keep="last")
-    out = pd.DataFrame()
+    newest = table.sort_values("scraped_hour_utc").drop_duplicates(["station", "target_hour_utc"], keep="last")
+    out = pd.DataFrame(index=pd.DatetimeIndex(sorted(newest["target_hour_utc"].unique()), name="target_hour_utc"))
+    ct = newest[newest["station"].isin(STATION_WEIGHTS)]
     for column, name in [("temp_f", "ct_temp_f"), ("dewpoint_f", "ct_dewpoint_f")]:
-        wide = newest.pivot(index="target_hour_utc", columns="station", values=column)
+        wide = ct.pivot(index="target_hour_utc", columns="station", values=column)
         weights = pd.Series(STATION_WEIGHTS)[wide.columns]
         total = (wide * weights).sum(axis=1, min_count=1)
         out[name] = total / wide.notna().mul(weights).sum(axis=1).replace(0, np.nan)
-    return out
+    for station, name in [("JFK", "jfk_temp_f"), ("BOS", "bos_temp_f")]:
+        out[name] = newest[newest["station"] == station].set_index("target_hour_utc")["temp_f"]
+    return out[names]
 
 
 def forecast_range(bucket, card, X, preds, targets):
@@ -232,17 +240,37 @@ def forest_range(bucket, card, X):
     missing = [name for name in model_features if name not in X.columns]
     if missing:
         raise ValueError("forecast-24h doesn't build these inputs from your model card: " + str(missing))
-    q = np.asarray(model.predict(X[model_features]), dtype=float)
-    if q.ndim != 2 or q.shape[1] != 3:
-        q = np.asarray(model.predict(X[model_features], quantiles=[0.1, 0.5, 0.9]), dtype=float)
-    q = np.sort(q, axis=1)
+    def three_columns(inputs):
+        """low, expected, high for each row, sorted"""
+        q = np.asarray(model.predict(inputs), dtype=float)
+        if q.ndim != 2 or q.shape[1] != 3:
+            q = np.asarray(model.predict(inputs, quantiles=[0.1, 0.5, 0.9]), dtype=float)
+        return np.sort(q, axis=1)
+
+    q = three_columns(X[model_features])
     low = q[:, 0]
     expected = q[:, 1]
     high = q[:, 2]
     widen = float(card.get("range_widen", 1.0))
-    low = expected - widen * (expected - low)
-    high = expected + widen * (high - expected)
-    return low, expected, high
+    low_side = widen * (expected - low)
+    high_side = widen * (high - expected)
+    # Optional (model card "nudge_temp_sd", e.g. 2.7 °F): the weather forecast is off by a few degrees, so nudge every
+    # temperature input up or down together, many times, and widen each hour's range by how far the expected value moves
+    nudge_sd = float(card.get("nudge_temp_sd", 0))
+    if nudge_sd > 0:
+        rng = np.random.default_rng(int(card.get("seed", 42)))
+        moved = []
+        for draw in range(int(card.get("nudge_draws", 30))):
+            nudged = X[model_features].copy()
+            shift = rng.normal(0, nudge_sd, len(nudged))
+            for column in TEMPERATURE_INPUTS:
+                if column in nudged.columns:
+                    nudged[column] = nudged[column] + shift
+            moved.append(three_columns(nudged)[:, 1])
+        weather_spread = 1.2816 * np.std(np.array(moved), axis=0)        # 1.2816 = how far the 10th/90th sit from the middle
+        low_side = np.sqrt(low_side ** 2 + weather_spread ** 2)
+        high_side = np.sqrt(high_side ** 2 + weather_spread ** 2)
+    return expected - low_side, expected, expected + high_side
 
 
 def pooled_range(bucket, card, targets, load, nws_weather, now):
@@ -338,8 +366,8 @@ def run_once(dry_run: bool = False) -> dict:
     X["load_yesterday_mw"] = X["load_yesterday_mw"].fillna(float(load.iloc[-1]))
     if X[WEATHER].isna().any().any():
         return {"status": "no_weather_data", "message": "The weather forecast does not cover the next 24 hours yet."}
-    X["ct_temp_f"] = X["ct_temp_f"].fillna(X["temp_f"])                  # Bradley stands in for a missing CT value
-    X["ct_dewpoint_f"] = X["ct_dewpoint_f"].fillna(X["dewpoint_f"])
+    for column, bradley in EXTRA_WEATHER.items():                         # Bradley stands in for a missing extra value
+        X[column] = X[column].fillna(X[bradley])
     X["solar_proxy"] = solar_proxy(targets, X["cloud_cover_pct"].values)  # again, after cloud cover gaps are filled
 
     preds = model.predict(X[FEATURES])

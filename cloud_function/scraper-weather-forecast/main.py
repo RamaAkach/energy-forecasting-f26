@@ -32,7 +32,8 @@ MAX_LEAD = int(os.getenv("MAX_LEAD_HOURS", "24"))
 USER_AGENT = os.getenv("USER_AGENT", "OPIM5512-student-scraper (UConn)")
 
 MASTER_KEY = f"{ENERGY_PREFIX}/datasets/bdl_weather_forecast_master.csv"
-# Final project: the NWS forecast at 6 more airports, for a population-weighted Connecticut temperature.
+# Final project: the NWS forecast at 8 more airports: 6 for a population-weighted Connecticut temperature, plus
+# JFK and Boston as an early warning for weather moving in.
 # Saved to their own file (one row per station, scrape hour and forecast hour); the Bradley file above never changes.
 CT_MASTER_KEY = f"{ENERGY_PREFIX}/datasets/ct_weather_forecast_master.csv"
 EXTRA_POINTS = {"HFD": ("41.7367", "-72.6494"),     # Hartford-Brainard
@@ -40,7 +41,9 @@ EXTRA_POINTS = {"HFD": ("41.7367", "-72.6494"),     # Hartford-Brainard
                 "HVN": ("41.2638", "-72.8868"),     # New Haven (Tweed)
                 "GON": ("41.3301", "-72.0451"),     # Groton-New London
                 "DXR": ("41.3715", "-73.4822"),     # Danbury
-                "HPN": ("41.0670", "-73.7076")}     # White Plains, NY (next to Fairfield County)
+                "HPN": ("41.0670", "-73.7076"),     # White Plains, NY (next to Fairfield County)
+                "JFK": ("40.6398", "-73.7789"),     # New York JFK: early warning for weather moving in
+                "BOS": ("42.3656", "-71.0096")}     # Boston Logan: early warning for weather moving in
 CT_COLUMNS = ["temp_f", "dewpoint_f"]
 # (DWML tag, its "type" attribute) -> our column name; units: F, %, mph, degrees, inches
 FIELDS = {("temperature", "hourly"): "temp_f", ("temperature", "dew point"): "dewpoint_f",
