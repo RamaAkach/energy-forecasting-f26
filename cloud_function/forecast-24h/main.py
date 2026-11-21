@@ -145,6 +145,26 @@ def latest_weather(forecasts: pd.DataFrame) -> pd.DataFrame:
     return newest
 
 
+LATEST_LOAD_FEATURES = ["hours_since_load", "latest_load_mw", "today_vs_yesterday_mw"]
+
+
+def latest_load_inputs(target_hours, load, newest):
+    """Final project (optional): what the load already told us when the forecast was made. newest = the newest hour of
+    load that is over (one time for a live forecast, or one per row when building training data). Returns how many hours
+    after it each target is, that load, and how far it ran above (+) or below (-) the same hour the day before."""
+    target_hours = pd.DatetimeIndex(target_hours)
+    if isinstance(newest, pd.Timestamp):
+        newest = pd.DatetimeIndex([newest] * len(target_hours))
+    newest = pd.DatetimeIndex(newest)
+    latest = load.reindex(newest).values
+    day_before = load.reindex(newest - pd.Timedelta(hours=24)).values
+    out = pd.DataFrame(index=target_hours)
+    out["hours_since_load"] = np.asarray((target_hours - newest) / pd.Timedelta(hours=1), dtype=float)
+    out["latest_load_mw"] = latest
+    out["today_vs_yesterday_mw"] = np.where(np.isnan(day_before), 0.0, latest - day_before)
+    return out[LATEST_LOAD_FEATURES]
+
+
 def ct_weather(bucket) -> pd.DataFrame:
     """Final project: for every target hour, from the NEWEST forecast of each airport, the population-weighted
     Connecticut temperature and dew point (weights re-scaled over the airports that have a value, so one missing
@@ -369,6 +389,8 @@ def run_once(dry_run: bool = False) -> dict:
     for column, bradley in EXTRA_WEATHER.items():                         # Bradley stands in for a missing extra value
         X[column] = X[column].fillna(X[bradley])
     X["solar_proxy"] = solar_proxy(targets, X["cloud_cover_pct"].values)  # again, after cloud cover gaps are filled
+    # The newest load that is over right now (a model uses these only if its model card lists them)
+    X = X.join(latest_load_inputs(targets, load, load.dropna().index.max()))
 
     preds = model.predict(X[FEATURES])
     range_error = ""
