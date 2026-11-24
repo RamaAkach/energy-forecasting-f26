@@ -165,6 +165,31 @@ def latest_load_inputs(target_hours, load, newest):
     return out[LATEST_LOAD_FEATURES]
 
 
+# Final project (optional): ISO New England's own Connecticut load forecast (saved every hour by scraper-isone) as an
+# input. Only versions ISO created by the top of this hour count, exactly like the training data.
+ISONE_FORECAST_KEY = f"{ENERGY_PREFIX}/datasets/isone_ct_forecast_master.csv"
+ISONE_FEATURES = ["isone_forecast_mw", "isone_age_hours"]
+ISONE_MISSING_AGE_HOURS = 48.0
+
+
+def isone_inputs(bucket, target_hours, made_by) -> pd.DataFrame:
+    """For every target hour, ISO-NE's newest forecast created at or before made_by, and how many hours before the
+    target that version was created. Hours with no version stay empty (run_once fills them)."""
+    target_hours = pd.DatetimeIndex(target_hours)
+    out = pd.DataFrame(index=target_hours, columns=ISONE_FEATURES, dtype=float)
+    table = read_csv(bucket, ISONE_FORECAST_KEY)
+    if table is None or len(table) == 0:
+        return out
+    table["issued_at_utc"] = pd.to_datetime(table["issued_at_utc"], utc=True)
+    table["target_hour_utc"] = pd.to_datetime(table["target_hour_utc"], utc=True)
+    table = table[(table["issued_at_utc"] <= made_by) & table["isone_forecast_mw"].notna()]
+    newest = table.sort_values("issued_at_utc").drop_duplicates("target_hour_utc", keep="last").set_index("target_hour_utc")
+    newest = newest.reindex(target_hours)
+    out["isone_forecast_mw"] = newest["isone_forecast_mw"].astype(float).values
+    out["isone_age_hours"] = np.asarray((target_hours - pd.DatetimeIndex(newest["issued_at_utc"])) / pd.Timedelta(hours=1), dtype=float)
+    return out
+
+
 def ct_weather(bucket) -> pd.DataFrame:
     """Final project: for every target hour, from the NEWEST forecast of each airport, the population-weighted
     Connecticut temperature and dew point (weights re-scaled over the airports that have a value, so one missing
@@ -391,6 +416,17 @@ def run_once(dry_run: bool = False) -> dict:
     X["solar_proxy"] = solar_proxy(targets, X["cloud_cover_pct"].values)  # again, after cloud cover gaps are filled
     # The newest load that is over right now (a model uses these only if its model card lists them)
     X = X.join(latest_load_inputs(targets, load, load.dropna().index.max()))
+    isone_hours = 0
+    if "isone_forecast_mw" in card.get("features", []):          # only models trained with ISO-NE's forecast read it
+        try:
+            X = X.join(isone_inputs(bucket, targets, this_hour))
+            isone_hours = int(X["isone_forecast_mw"].notna().sum())
+        except Exception as err:
+            logging.warning("ISO-NE forecast not available: %s", err)
+            X = X.drop(columns=ISONE_FEATURES, errors="ignore").join(pd.DataFrame(index=targets, columns=ISONE_FEATURES, dtype=float))
+        # Honest gap filling (rare): no ISO version for an hour -> yesterday's load stands in, as in training
+        X["isone_forecast_mw"] = X["isone_forecast_mw"].fillna(X["load_yesterday_mw"])
+        X["isone_age_hours"] = X["isone_age_hours"].fillna(ISONE_MISSING_AGE_HOURS)
 
     preds = model.predict(X[FEATURES])
     range_error = ""
@@ -429,7 +465,8 @@ def run_once(dry_run: bool = False) -> dict:
                "avg_range_width_mw": None if low is None or np.isnan(low).all() else round(float(np.mean(high - low)), 1),
                "range_error": range_error,
                "filled_weather_values": filled_weather, "filled_load_values": filled_load,
-               "model_features": len(card.get("features", FEATURES)), "ct_weather_hours": ct_hours_found}
+               "model_features": len(card.get("features", FEATURES)), "ct_weather_hours": ct_hours_found,
+               "isone_forecast_hours": isone_hours}
     summary.update(pool_info)
     if dry_run:
         summary["dry_run"] = True
